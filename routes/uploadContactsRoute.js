@@ -24,7 +24,7 @@ router.post("/upload", verifyToken, async (req, res) => {
     const userId = req.user.userId;
     if (!userId) return res.status(400).json({ message: "Invalid user" });
 
-    const { contacts, totalContactsUploaded, creditPayload } = req.body;
+    const { contacts, creditPayload } = req.body;
     // creditPayload = the payload sent from frontend
 
     if (!contacts || !Array.isArray(contacts))
@@ -143,6 +143,7 @@ router.post("/upload", verifyToken, async (req, res) => {
         designation: c.workInfo?.designation || "",
         email: c.workInfo?.email || "",
         contactNumber: c.workInfo?.phone || "",
+        originalContactId: c.originalContactId || "",
         userId
       }));
 
@@ -184,12 +185,18 @@ router.post("/upload", verifyToken, async (req, res) => {
       deletedAt: contact.isDeleted ? new Date() : null
     }));
 
-    const savedUpload = await new UploadedContacts({
-      userId: userObjectId,
-      lastUploaded: new Date(),
-      totalContactsUploaded,
-      contacts: processedContacts
-    }).save();
+    // Upsert into this user's single UploadedContacts document instead of
+    // creating a new one per upload call, so repeated uploads accumulate
+    // into one record (mirroring how userContacts/purchasedContacts work).
+    const savedUpload = await UploadedContacts.findOneAndUpdate(
+      { userId: userObjectId },
+      {
+        $push: { contacts: { $each: processedContacts } },
+        $set: { lastUploaded: new Date() },
+        $inc: { totalContactsUploaded: processedContacts.length }
+      },
+      { upsert: true, new: true }
+    );
 
     console.log("✅ Upload saved:", savedUpload._id);
 

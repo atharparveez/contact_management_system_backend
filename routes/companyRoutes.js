@@ -1,5 +1,6 @@
 import express from "express";
 import Company from "../models/companyModel.js";
+import PurchasedContacts from "../models/purchasedContactsModel.js";
 import { verifyToken } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
@@ -34,6 +35,21 @@ router.get("/employees", verifyToken, async (req, res) => {
       return res.status(404).json({ message: "No matching companies found" });
     }
 
+    // 🧠 Which of this user's already-purchased employeeRecordIds show up in
+    // these results, so the app can show "purchased by you" instead of the
+    // buy button on a repeat search. employeeRecordId (the Company.employees
+    // subdocument's own _id) is used rather than originalContactId because
+    // most employee records are directory data that was never uploaded
+    // through the app and so has no originalContactId at all.
+    const purchasedDoc = await PurchasedContacts.findOne({ userId: req.user.userId })
+      .select("contacts.employeeRecordId -_id")
+      .lean();
+    const purchasedIds = new Set(
+      (purchasedDoc?.contacts || [])
+        .map((c) => c.employeeRecordId)
+        .filter(Boolean)
+    );
+
     // 🧾 Format full company info + employees
     const response = companies.map((company) => ({
       companyName: company.companyName,
@@ -42,7 +58,11 @@ router.get("/employees", verifyToken, async (req, res) => {
       city: company.city,
       state: company.state,
       country: company.country,
-      employees: company.employees || [],
+      employees: (company.employees || []).map((employee) => ({
+        ...employee.toObject(),
+        employeeRecordId: employee._id.toString(),
+        purchasedByMe: purchasedIds.has(employee._id.toString()),
+      })),
     }));
 
     res.json(response);

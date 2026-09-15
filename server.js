@@ -6,6 +6,7 @@ import userRoutes from "./routes/userRoutes.js";
 import userContactsRoutes from "./routes/userContactsRoute.js";
 import uploadContactsRoute from "./routes/uploadContactsRoute.js";
 import purchasedContactsRoute from "./routes/purchasedContactsRoute.js";
+import supportRoutes from "./routes/supportRoutes.js";
 
 const app = express();
 
@@ -23,7 +24,8 @@ app.use("/api/users", userRoutes);
 app.use("/api/companies", companyRoutes);
 app.use("/api/userContacts", userContactsRoutes);
 app.use("/api/contacts", uploadContactsRoute); 
-app.use("/api/contacts", purchasedContactsRoute); 
+app.use("/api/contacts", purchasedContactsRoute);
+app.use("/api/support", supportRoutes);
 
 
 // ✅ Start server

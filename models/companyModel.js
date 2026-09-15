@@ -5,7 +5,8 @@ const employeeSchema = new mongoose.Schema({
   designation: String,
   email: String,
   contactNumber: String,
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" } 
+  originalContactId: String,
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" }
 });
 
 const companySchema = new mongoose.Schema({

@@ -12,6 +12,13 @@ const contactSchema = new mongoose.Schema({
   uploadedAt: Date,
   originalContactId: String,
 
+  // The Company.employees subdocument's own _id -- always present (even for
+  // directory data that was never uploaded through the app), so this is the
+  // stable key used to identify what was purchased and to dedupe repeat
+  // purchases. originalContactId above is populated only when the record
+  // could be traced back to a real app upload.
+  employeeRecordId: String,
+
   action: { type: String, default: "purchase" },
   credits: { type: Number, default: -5 },
 
