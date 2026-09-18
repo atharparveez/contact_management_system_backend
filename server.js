@@ -1,14 +1,18 @@
 // server.js
 import express from "express";
+import cors from "cors";
 import connectDB from "./config/db.js";
 import companyRoutes from "./routes/companyRoutes.js";
-import userRoutes from "./routes/userRoutes.js"; 
+import userRoutes from "./routes/userRoutes.js";
 import userContactsRoutes from "./routes/userContactsRoute.js";
 import uploadContactsRoute from "./routes/uploadContactsRoute.js";
 import purchasedContactsRoute from "./routes/purchasedContactsRoute.js";
 import supportRoutes from "./routes/supportRoutes.js";
 
 const app = express();
+
+// ✅ Allow the browser frontend to call this API
+app.use(cors());
 
 // ✅ Parse JSON globally (for POST/PUT requests)
 app.use(express.json());

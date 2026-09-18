@@ -4,7 +4,8 @@ import express from "express";
 import mongoose from "mongoose";
 import UploadedContacts from "../models/uploadedContactsModel.js";
 import Company from "../models/companyModel.js";
-import CreditTransactions from "../models/creditTransactions.js";  
+import CreditTransactions from "../models/creditTransactions.js";
+import User from "../models/userModel.js";
 import { verifyToken } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
@@ -231,6 +232,66 @@ router.post("/upload", verifyToken, async (req, res) => {
   }
 });
 
+
+// ===================== NEW CODE (added for web "My Contacts" tab) =====================
+// Populates a user's "My Contacts" list by matching contact records — uploaded by ANYONE —
+// against this user's own registered email addresses (workInfo.email / personalInfo.email).
+// The web app has no device-contacts concept to sync from (unlike the mobile app), so this
+// endpoint is a web-specific substitute data source for that tab. This is new server-side
+// logic; review before merging.
+/**
+ * ============================================================
+ *  GET /api/contacts/linkedByEmail
+ *  Fetch contacts (uploaded by anyone) whose email matches
+ *  the logged-in user's own registered email address(es)
+ * ============================================================
+ */
+router.get("/linkedByEmail", verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    if (!userId) return res.status(400).json({ message: "Invalid user" });
+
+    const currentUser = await User.findById(userId).select(
+      "workInfo.email personalInfo.email"
+    );
+    if (!currentUser) return res.status(404).json({ message: "User not found" });
+
+    const emails = [currentUser.workInfo?.email, currentUser.personalInfo?.email]
+      .filter(Boolean)
+      .map((e) => e.trim().toLowerCase())
+      .filter((e) => e.length > 0);
+
+    if (emails.length === 0) {
+      return res.status(200).json({ contacts: [] });
+    }
+
+    const emailRegexes = emails.map((e) => new RegExp(`^${escapeRegex(e)}$`, "i"));
+
+    const uploads = await UploadedContacts.find({
+      $or: [
+        { "contacts.personalInfo.email": { $in: emailRegexes } },
+        { "contacts.workInfo.email": { $in: emailRegexes } },
+      ],
+    });
+
+    const matched = [];
+    uploads.forEach((upload) => {
+      upload.contacts.forEach((c) => {
+        const personalEmail = (c.personalInfo?.email || "").trim().toLowerCase();
+        const workEmail = (c.workInfo?.email || "").trim().toLowerCase();
+        if (emails.includes(personalEmail) || emails.includes(workEmail)) {
+          matched.push(c);
+        }
+      });
+    });
+
+    res.status(200).json({ contacts: matched });
+  } catch (error) {
+    console.error("❌ Error fetching linked-by-email contacts:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+// ========================================================================================
 
 /**
  * ============================================================
