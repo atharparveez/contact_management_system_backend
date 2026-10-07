@@ -19,10 +19,13 @@
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "google-auth-library": "^11.0.2",
+    "i18n-iso-countries": "^7.14.0",
     "jsonwebtoken": "^9.0.2",
+    "libphonenumber-js": "^1.13.14",
     "mongoose": "^8.19.1",
     "multer": "^2.0.2",
     "multer-s3": "^3.0.1",
+    "node-cron": "^4.6.0",
     "nodemailer": "^10.0.1"
   }
 }

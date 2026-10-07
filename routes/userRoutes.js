@@ -16,6 +16,21 @@ const LINKEDIN_CLIENT_ID = process.env.LINKEDIN_CLIENT_ID;
 const LINKEDIN_CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET;
 const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI;
 const APP_OAUTH_CALLBACK_SCHEME = process.env.APP_OAUTH_CALLBACK_SCHEME;
+const WEB_OAUTH_CALLBACK_URL = process.env.WEB_OAUTH_CALLBACK_URL;
+
+// A web-initiated LinkedIn sign-in encodes { csrf, client: "web" } as base64url
+// JSON in `state` (see web's LinkedIn button) so this callback can tell it apart
+// from the mobile app's plain random-hex state and redirect to a real web URL
+// instead of the app's custom scheme. Any state that isn't valid base64url JSON
+// (i.e. mobile's) falls through to the existing app-scheme behavior untouched.
+function isWebOAuthState(state) {
+  try {
+    const decoded = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
+    return decoded?.client === "web";
+  } catch {
+    return false;
+  }
+}
 
 const googleClient = new OAuth2Client(GOOGLE_WEB_CLIENT_ID);
 
@@ -215,13 +230,20 @@ router.post("/login/google", async (req, res) => {
  * watching for. `state` is round-tripped untouched so the app can verify it
  * matches what it generated (CSRF protection), since the backend itself
  * didn't originate the request.
+ *
+ * The web app shares this exact same redirect_uri (no second LinkedIn app
+ * registration needed) but obviously can't catch a custom app scheme, so it
+ * flags itself by encoding `{ csrf, client: "web" }` as base64url JSON into
+ * `state` -- see isWebOAuthState() above -- and this route redirects those
+ * to WEB_OAUTH_CALLBACK_URL instead.
  */
 router.get("/login/linkedin/callback", async (req, res) => {
   const { code, state, error: linkedinError } = req.query;
 
+  const redirectTarget = isWebOAuthState(state) ? WEB_OAUTH_CALLBACK_URL : APP_OAUTH_CALLBACK_SCHEME;
   const redirectToApp = (params) => {
     const query = new URLSearchParams(params).toString();
-    res.redirect(`${APP_OAUTH_CALLBACK_SCHEME}?${query}`);
+    res.redirect(`${redirectTarget}?${query}`);
   };
 
   if (linkedinError) {

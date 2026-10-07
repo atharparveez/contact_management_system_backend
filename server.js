@@ -8,6 +8,10 @@ import userContactsRoutes from "./routes/userContactsRoute.js";
 import uploadContactsRoute from "./routes/uploadContactsRoute.js";
 import purchasedContactsRoute from "./routes/purchasedContactsRoute.js";
 import supportRoutes from "./routes/supportRoutes.js";
+import googleSyncRoutes from "./routes/googleSyncRoutes.js";
+import microsoftSyncRoutes from "./routes/microsoftSyncRoutes.js";
+import pendingContactsRoutes from "./routes/pendingContactsRoutes.js";
+import { startContactSyncScheduler } from "./services/contactSyncScheduler.js";
 
 const app = express();
 
@@ -30,10 +34,14 @@ app.use("/api/userContacts", userContactsRoutes);
 app.use("/api/contacts", uploadContactsRoute); 
 app.use("/api/contacts", purchasedContactsRoute);
 app.use("/api/support", supportRoutes);
+app.use("/api/googleSync", googleSyncRoutes);
+app.use("/api/microsoftSync", microsoftSyncRoutes);
+app.use("/api/contactSync", pendingContactsRoutes);
 
 
 // ✅ Start server
 const PORT = 5001;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  startContactSyncScheduler();
 });

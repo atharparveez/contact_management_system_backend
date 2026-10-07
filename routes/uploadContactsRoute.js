@@ -7,11 +7,269 @@ import Company from "../models/companyModel.js";
 import CreditTransactions from "../models/creditTransactions.js";
 import User from "../models/userModel.js";
 import { verifyToken } from "../middleware/authMiddleware.js";
+import { isPhoneValid, hasMxRecord } from "../utils/contactValidation.js";
 
 const router = express.Router();
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Shared core of POST /upload, pulled out so the pending-Google-sync upload
+ * route (routes/googleSyncRoutes.js) can reuse the exact same dedupe/
+ * Company-upsert/credit-transaction logic instead of duplicating it.
+ * Returns a plain { status, body } result; callers translate it to HTTP responses.
+ */
+export async function performContactsUpload({ userId, contacts, creditPayload }) {
+  if (!userId) return { status: 400, body: { message: "Invalid user" } };
+  if (!contacts || !Array.isArray(contacts)) {
+    return { status: 400, body: { message: "Contacts must be an array" } };
+  }
+
+  // -----------------------------------------------------------
+  // 1️⃣ STRICT DUPLICATE CHECK USING fname + lname + phone + email
+  // -----------------------------------------------------------
+  const userObjectId = new mongoose.Types.ObjectId(userId);
+
+  const previousUploads = await UploadedContacts.find({ userId: userObjectId });
+  let existingContacts = [];
+  previousUploads.forEach(upload => {
+    upload.contacts.forEach(c => {
+      existingContacts.push({
+        fname: (c.fname || "").trim().toLowerCase(),
+        lname: (c.lname || "").trim().toLowerCase(),
+        phone: ((c.personalInfo?.phone || c.workInfo?.phone) || "").trim(),
+        email: ((c.personalInfo?.email || c.workInfo?.email) || "").trim().toLowerCase()
+      });
+    });
+  });
+
+  const duplicates = contacts.filter(c => {
+    const fname = (c.fname || "").trim().toLowerCase();
+    const lname = (c.lname || "").trim().toLowerCase();
+    const phone = ((c.personalInfo?.phone || c.workInfo?.phone) || "").trim();
+    const email = ((c.personalInfo?.email || c.workInfo?.email) || "").trim().toLowerCase();
+
+    return existingContacts.some(ex =>
+      ex.fname === fname &&
+      ex.lname === lname &&
+      ex.phone === phone &&
+      ex.email === email
+    );
+  });
+
+  if (duplicates.length > 0) {
+    return {
+      status: 200,
+      body: {
+        error: true,
+        message: "Some contacts were already uploaded",
+        duplicates: duplicates.map(c => ({
+          fname: c.fname,
+          lname: c.lname,
+          phone: c.personalInfo?.phone || c.workInfo?.phone,
+          email: c.personalInfo?.email || c.workInfo?.email
+        }))
+      }
+    };
+  }
+
+  // -----------------------------------------------------------
+  // 2️⃣ Phone numbers (libphonenumber, keyed off each contact's own country
+  // field -- or parsed directly when already in +<countrycode> format) and
+  // email domains (MX lookup, falling back to an A-record check) must be
+  // real before we hand out credits for a contact.
+  // -----------------------------------------------------------
+  const invalidContacts = [];
+  await Promise.all(
+    contacts.map(async (c) => {
+      const reasons = [];
+
+      if (c.workInfo?.phone && !isPhoneValid(c.workInfo.phone, c.workInfo?.country)) {
+        reasons.push(`Invalid work phone number: ${c.workInfo.phone}`);
+      }
+      if (c.personalInfo?.phone && !isPhoneValid(c.personalInfo.phone, c.personalInfo?.country)) {
+        reasons.push(`Invalid personal phone number: ${c.personalInfo.phone}`);
+      }
+
+      const [workEmailOk, personalEmailOk] = await Promise.all([
+        c.workInfo?.email ? hasMxRecord(c.workInfo.email) : true,
+        c.personalInfo?.email ? hasMxRecord(c.personalInfo.email) : true,
+      ]);
+      if (!workEmailOk) reasons.push(`Work email domain doesn't exist: ${c.workInfo.email}`);
+      if (!personalEmailOk) reasons.push(`Personal email domain doesn't exist: ${c.personalInfo.email}`);
+
+      if (reasons.length > 0) {
+        invalidContacts.push({ fname: c.fname, lname: c.lname, reasons });
+      }
+    })
+  );
+
+  if (invalidContacts.length > 0) {
+    return {
+      status: 400,
+      body: {
+        error: true,
+        message: "Some contacts have an invalid phone number or email domain",
+        invalidContacts,
+      },
+    };
+  }
+
+  // -----------------------------------------------------------
+  // 3️⃣ Work company is mandatory for every contact being uploaded
+  // -----------------------------------------------------------
+  const missingCompany = contacts.filter(c => !c.workInfo?.company?.trim());
+  if (missingCompany.length > 0) {
+    return {
+      status: 400,
+      body: {
+        error: true,
+        message: "Work company is required for all contacts",
+        missingCompany: missingCompany.map(c => ({
+          fname: c.fname,
+          lname: c.lname
+        }))
+      }
+    };
+  }
+
+  // -----------------------------------------------------------
+  // 4️⃣ Extract unique company names
+  // -----------------------------------------------------------
+  const companiesInUpload = [
+    ...new Set(
+      contacts.map(c => c.workInfo.company.trim())
+    )
+  ];
+
+  console.log("🔍 Companies in upload:", companiesInUpload);
+
+  // -----------------------------------------------------------
+  // 5️⃣ Find existing companies (case-insensitive)
+  // -----------------------------------------------------------
+  const existingCompanies = await Company.find({
+    companyName: {
+      $in: companiesInUpload.map(name => new RegExp(`^${escapeRegex(name)}$`, "i"))
+    }
+  });
+
+  // normalized (lowercase) name -> canonical companyName already stored in DB
+  const existingNameMap = new Map(
+    existingCompanies.map(c => [c.companyName.trim().toLowerCase(), c.companyName])
+  );
+  console.log("📌 Existing companies:", [...existingNameMap.values()]);
+
+  // -----------------------------------------------------------
+  // 6️⃣ Group contacts by company (case-insensitive)
+  // -----------------------------------------------------------
+  const groupedByCompany = {};
+  contacts.forEach(contact => {
+    const rawCompanyName = contact.workInfo.company.trim();
+    const normalized = rawCompanyName.toLowerCase();
+    if (!groupedByCompany[normalized]) {
+      groupedByCompany[normalized] = {
+        canonicalName: existingNameMap.get(normalized) || rawCompanyName,
+        contacts: []
+      };
+    }
+    groupedByCompany[normalized].contacts.push(contact);
+  });
+
+  // -----------------------------------------------------------
+  // 7️⃣ Process new & existing companies
+  // -----------------------------------------------------------
+  for (const normalized of Object.keys(groupedByCompany)) {
+    const { canonicalName, contacts: employeesForCompany } = groupedByCompany[normalized];
+
+    const employeeDocs = employeesForCompany.map(c => ({
+      name: `${c.fname ?? ""} ${c.mname ?? ""} ${c.lname ?? ""}`.trim(),
+      designation: c.workInfo?.designation || "",
+      email: c.workInfo?.email || "",
+      contactNumber: c.workInfo?.phone || "",
+      originalContactId: c.originalContactId || "",
+      userId
+    }));
+
+    if (existingNameMap.has(normalized)) {
+      console.log(`➡️ Appending employees to existing company: ${canonicalName}`);
+
+      await Company.updateOne(
+        { companyName: canonicalName },
+        { $push: { employees: { $each: employeeDocs } } }
+      );
+
+    } else {
+      console.log(`🆕 Creating new company document: ${canonicalName}`);
+
+      const firstContact = employeesForCompany[0];
+
+      await Company.create({
+        companyName: canonicalName,
+        category: firstContact.workInfo?.category || "",
+        categoryName: firstContact.workInfo?.categoryName || "",
+        website: firstContact.workInfo?.website || "",
+        city: firstContact.workInfo?.city || "",
+        state: firstContact.workInfo?.state || "",
+        country: firstContact.workInfo?.country || "",
+        userId,
+        employees: employeeDocs
+      });
+    }
+  }
+
+  // -----------------------------------------------------------
+  // 8️⃣ Save uploaded contacts
+  // -----------------------------------------------------------
+  const processedContacts = contacts.map(contact => ({
+    ...contact,
+    action: contact.action || "upload",
+    credits: contact.credits ?? 5,
+    uploadedAt: new Date(),
+    deletedAt: contact.isDeleted ? new Date() : null
+  }));
+
+  // Upsert into this user's single UploadedContacts document instead of
+  // creating a new one per upload call, so repeated uploads accumulate
+  // into one record (mirroring how userContacts/purchasedContacts work).
+  const savedUpload = await UploadedContacts.findOneAndUpdate(
+    { userId: userObjectId },
+    {
+      $push: { contacts: { $each: processedContacts } },
+      $set: { lastUploaded: new Date() },
+      $inc: { totalContactsUploaded: processedContacts.length }
+    },
+    { upsert: true, new: true }
+  );
+
+  console.log("✅ Upload saved:", savedUpload._id);
+
+  // -----------------------------------------------------------
+  // 9️⃣ NEW: Save credit transaction
+  // -----------------------------------------------------------
+  if (creditPayload) {
+    console.log("📦 Saving credit transaction:", creditPayload);
+
+    await CreditTransactions.create({
+      userId: userObjectId,
+      action: creditPayload.action,
+      points: creditPayload.points,
+      metadata: creditPayload.metadata || {},
+      createdAt: new Date()
+    });
+
+    console.log("💰 Credit transaction saved");
+  }
+
+  return {
+    status: 201,
+    body: {
+      message: "Contacts uploaded successfully",
+      data: savedUpload,
+      checkedCompanies: [...existingNameMap.values()]
+    }
+  };
 }
 
 /**
@@ -22,210 +280,10 @@ function escapeRegex(str) {
  */
 router.post("/upload", verifyToken, async (req, res) => {
   try {
-    const userId = req.user.userId;
-    if (!userId) return res.status(400).json({ message: "Invalid user" });
-
     const { contacts, creditPayload } = req.body;
     // creditPayload = the payload sent from frontend
-
-    if (!contacts || !Array.isArray(contacts))
-      return res.status(400).json({ message: "Contacts must be an array" });
-
-    // -----------------------------------------------------------
-    // 1️⃣ STRICT DUPLICATE CHECK USING fname + lname + phone + email
-    // -----------------------------------------------------------
-    const userObjectId = new mongoose.Types.ObjectId(userId);
-
-    const previousUploads = await UploadedContacts.find({ userId: userObjectId });
-    let existingContacts = [];
-    previousUploads.forEach(upload => {
-      upload.contacts.forEach(c => {
-        existingContacts.push({
-          fname: (c.fname || "").trim().toLowerCase(),
-          lname: (c.lname || "").trim().toLowerCase(),
-          phone: ((c.personalInfo?.phone || c.workInfo?.phone) || "").trim(),
-          email: ((c.personalInfo?.email || c.workInfo?.email) || "").trim().toLowerCase()
-        });
-      });
-    });
-
-    const duplicates = contacts.filter(c => {
-      const fname = (c.fname || "").trim().toLowerCase();
-      const lname = (c.lname || "").trim().toLowerCase();
-      const phone = ((c.personalInfo?.phone || c.workInfo?.phone) || "").trim();
-      const email = ((c.personalInfo?.email || c.workInfo?.email) || "").trim().toLowerCase();
-
-      return existingContacts.some(ex =>
-        ex.fname === fname &&
-        ex.lname === lname &&
-        ex.phone === phone &&
-        ex.email === email
-      );
-    });
-
-    if (duplicates.length > 0) {
-      return res.status(200).json({
-        error: true,
-        message: "Some contacts were already uploaded",
-        duplicates: duplicates.map(c => ({
-          fname: c.fname,
-          lname: c.lname,
-          phone: c.personalInfo?.phone || c.workInfo?.phone,
-          email: c.personalInfo?.email || c.workInfo?.email
-        }))
-      });
-    }
-
-    // -----------------------------------------------------------
-    // 2️⃣ Work company is mandatory for every contact being uploaded
-    // -----------------------------------------------------------
-    const missingCompany = contacts.filter(c => !c.workInfo?.company?.trim());
-    if (missingCompany.length > 0) {
-      return res.status(400).json({
-        error: true,
-        message: "Work company is required for all contacts",
-        missingCompany: missingCompany.map(c => ({
-          fname: c.fname,
-          lname: c.lname
-        }))
-      });
-    }
-
-    // -----------------------------------------------------------
-    // 3️⃣ Extract unique company names
-    // -----------------------------------------------------------
-    const companiesInUpload = [
-      ...new Set(
-        contacts.map(c => c.workInfo.company.trim())
-      )
-    ];
-
-    console.log("🔍 Companies in upload:", companiesInUpload);
-
-    // -----------------------------------------------------------
-    // 4️⃣ Find existing companies (case-insensitive)
-    // -----------------------------------------------------------
-    const existingCompanies = await Company.find({
-      companyName: {
-        $in: companiesInUpload.map(name => new RegExp(`^${escapeRegex(name)}$`, "i"))
-      }
-    });
-
-    // normalized (lowercase) name -> canonical companyName already stored in DB
-    const existingNameMap = new Map(
-      existingCompanies.map(c => [c.companyName.trim().toLowerCase(), c.companyName])
-    );
-    console.log("📌 Existing companies:", [...existingNameMap.values()]);
-
-    // -----------------------------------------------------------
-    // 5️⃣ Group contacts by company (case-insensitive)
-    // -----------------------------------------------------------
-    const groupedByCompany = {};
-    contacts.forEach(contact => {
-      const rawCompanyName = contact.workInfo.company.trim();
-      const normalized = rawCompanyName.toLowerCase();
-      if (!groupedByCompany[normalized]) {
-        groupedByCompany[normalized] = {
-          canonicalName: existingNameMap.get(normalized) || rawCompanyName,
-          contacts: []
-        };
-      }
-      groupedByCompany[normalized].contacts.push(contact);
-    });
-
-    // -----------------------------------------------------------
-    // 6️⃣ Process new & existing companies
-    // -----------------------------------------------------------
-    for (const normalized of Object.keys(groupedByCompany)) {
-      const { canonicalName, contacts: employeesForCompany } = groupedByCompany[normalized];
-
-      const employeeDocs = employeesForCompany.map(c => ({
-        name: `${c.fname ?? ""} ${c.mname ?? ""} ${c.lname ?? ""}`.trim(),
-        designation: c.workInfo?.designation || "",
-        email: c.workInfo?.email || "",
-        contactNumber: c.workInfo?.phone || "",
-        originalContactId: c.originalContactId || "",
-        userId
-      }));
-
-      if (existingNameMap.has(normalized)) {
-        console.log(`➡️ Appending employees to existing company: ${canonicalName}`);
-
-        await Company.updateOne(
-          { companyName: canonicalName },
-          { $push: { employees: { $each: employeeDocs } } }
-        );
-
-      } else {
-        console.log(`🆕 Creating new company document: ${canonicalName}`);
-
-        const firstContact = employeesForCompany[0];
-
-        await Company.create({
-          companyName: canonicalName,
-          category: firstContact.workInfo?.category || "",
-          categoryName: firstContact.workInfo?.categoryName || "",
-          website: firstContact.workInfo?.website || "",
-          city: firstContact.workInfo?.city || "",
-          state: firstContact.workInfo?.state || "",
-          country: firstContact.workInfo?.country || "",
-          userId,
-          employees: employeeDocs
-        });
-      }
-    }
-
-    // -----------------------------------------------------------
-    // 7️⃣ Save uploaded contacts
-    // -----------------------------------------------------------
-    const processedContacts = contacts.map(contact => ({
-      ...contact,
-      action: contact.action || "upload",
-      credits: contact.credits ?? 5,
-      uploadedAt: new Date(),
-      deletedAt: contact.isDeleted ? new Date() : null
-    }));
-
-    // Upsert into this user's single UploadedContacts document instead of
-    // creating a new one per upload call, so repeated uploads accumulate
-    // into one record (mirroring how userContacts/purchasedContacts work).
-    const savedUpload = await UploadedContacts.findOneAndUpdate(
-      { userId: userObjectId },
-      {
-        $push: { contacts: { $each: processedContacts } },
-        $set: { lastUploaded: new Date() },
-        $inc: { totalContactsUploaded: processedContacts.length }
-      },
-      { upsert: true, new: true }
-    );
-
-    console.log("✅ Upload saved:", savedUpload._id);
-
-    // -----------------------------------------------------------
-    // 8️⃣ NEW: Save credit transaction
-    // -----------------------------------------------------------
-    if (creditPayload) {
-      console.log("📦 Saving credit transaction:", creditPayload);
-
-      await CreditTransactions.create({
-        userId: userObjectId,
-        action: creditPayload.action,
-        points: creditPayload.points,
-        metadata: creditPayload.metadata || {},
-        createdAt: new Date()
-      });
-
-      console.log("💰 Credit transaction saved");
-    }
-
-    // -----------------------------------------------------------
-
-    res.status(201).json({
-      message: "Contacts uploaded successfully",
-      data: savedUpload,
-      checkedCompanies: [...existingNameMap.values()]
-    });
-
+    const result = await performContactsUpload({ userId: req.user.userId, contacts, creditPayload });
+    res.status(result.status).json(result.body);
   } catch (error) {
     console.error("❌ Error uploading contacts:", error);
     res.status(500).json({ error: "Server error" });

@@ -58,6 +58,20 @@ const userSchema = new mongoose.Schema(
     // False only for social-login accounts that haven't filled in the rest
     // of their profile (designation, company, etc.) yet.
     profileCompleted: { type: Boolean, default: true },
+    // Background Google Contacts sync (separate from Google sign-in/googleId
+    // above -- this is an offline-access refresh token granted specifically
+    // for reading contacts on a schedule, not for authenticating this user).
+    googleSync: {
+      enabled: { type: Boolean, default: false },
+      refreshToken: { type: String },
+      lastSyncedAt: { type: Date },
+    },
+    // Same idea as googleSync, for Microsoft Graph Contacts.
+    microsoftSync: {
+      enabled: { type: Boolean, default: false },
+      refreshToken: { type: String },
+      lastSyncedAt: { type: Date },
+    },
   },
   { timestamps: true } // Automatically adds createdAt & updatedAt
 );
